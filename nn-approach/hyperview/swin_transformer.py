@@ -7,6 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
+import math
+
+import optuna
+from functools import partial
+
 import pandas as pd
 import numpy as np
 
@@ -26,14 +31,13 @@ from sklearn.cluster import KMeans
 # %%
 SEED = 42
 VL_SPLIT  = 0.2
-LR = 1e-4
-MOMENTUM = 0.9
-WEIGHT_DECAY = 5e-4
 
 WIDTH = 128
 HEIGHT = 128
 device = "cuda" if torch.cuda.is_available() else "cpu"
 device = torch.device(device)
+
+print(device)
 
 def set_random_seed(seed=42):
     random.seed(seed)
@@ -42,7 +46,7 @@ def set_random_seed(seed=42):
 
 set_random_seed(seed = SEED)
 
-base_path = "/data/"
+base_path = "/root/space-ai/nn-approach/hyperview/data/"
 
 gt_path = base_path + 'train_gt.csv'
 wavelength_path = base_path + 'wavelengths.csv'
@@ -132,20 +136,6 @@ X_train_base, _ = load_data(base_path + "train_data", tr = train_transform)
 X_test_base, _ = load_data(base_path + "test_data", tr = eval_transform)
 y_train_base = load_gt(base_path + "train_gt.csv")
 
-# %% [markdown]
-# ## Model Definition
-
-# %%
-non_pretrained_model = models.swin_v2_b()
-pretrained_model = models.swin_v2_b(weights= models.Swin_V2_B_Weights.DEFAULT)
-
-num_features = pretrained_model.head.in_features
-pretrained_model.head = torch.nn.Linear(num_features, 4)
-non_pretrained_model.head = torch.nn.Linear(num_features, 4)
-
-non_pretrained_model = non_pretrained_model.to(device)
-pretrained_model = pretrained_model.to(device)
-
 # %%
 # values = list(sizes)
 
@@ -188,9 +178,9 @@ pretrained_model = pretrained_model.to(device)
 # X_test_mid = torch.stack(gruppi[0])
 # X_test_big = torch.stack(gruppi[2])
 
-X_train = torch.stack(X_train_base)
-X_test = torch.stack(X_test_base)
-y_train = torch.Tensor(y_train_base)
+X_train = torch.stack([x.detach() for x in X_train_base])
+X_test = torch.stack([x.detach() for x in X_test_base])
+y_train = torch.tensor(y_train_base, dtype=torch.float32)
 
 # print(X_train_sml.shape)
 # print(X_train_mid.shape)
@@ -210,8 +200,8 @@ dataset=TensorDataset(X_train,y_train)
 n = int(len(X_train) * VL_SPLIT)
 train_dataset, val_dataset = torch.utils.data.random_split(dataset, [n, len(dataset) - n])
 
-train_dataloader = DataLoader(train_dataset,batch_size=32,shuffle=True)
-val_dataloader = DataLoader(val_dataset,batch_size=32,shuffle=True) 
+train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
 testset=TensorDataset(X_test)
 
@@ -223,95 +213,118 @@ test_dataloader= DataLoader(testset,shuffle=False)
 # %%
 criterion = nn.MSELoss()
 
-pretrained_optimizer = torch.optim.SGD(pretrained_model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
-non_pretrained_optimizer = torch.optim.SGD(non_pretrained_model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
-
-def train_one_epoch(m,o):
+def train_one_epoch(m, o):
     running_loss = 0.
-    num_samples = 0
-
-    for _, data in enumerate(train_dataloader):
+    for data in train_dataloader:
         inputs, labels = data
-
         o.zero_grad()
-
         outputs = m(inputs.to(device))
-        
         loss = criterion(outputs, labels.to(device))
-        loss.backward()
+        loss.backward(retain_graph=True)
         o.step()
-
         running_loss += loss.item()
-        num_samples += inputs.size(0)
-        
-    train_loss = running_loss / len(train_dataloader)
-
-    return train_loss
+    return running_loss / len(train_dataloader)
 
 # %%
-def train(m,o,path = ""):
-    epoch_number = 0
-    tr_acc = 0.0
-    best_vloss = 1_000_000.
-
-    for epoch in range(100):
-        print('============= EPOCH {} ============='.format(epoch_number + 1))
-
+def train(m, o, path="", patience=10):
+    best_vloss = float('inf')
+    patience_counter = 0
+    
+    for epoch in range(500):
+        print(f'============= EPOCH {epoch + 1} =============')
         m.train(True)
         avg_loss = train_one_epoch(m, o)
-
-        running_vloss = 0.0
-        val_acc = 0.0
-        num_vcorrect = 0
-        num_vsamples = 0
-
+        
         m.eval()
-
-        # Disable gradient computation and reduce memory consumption.
+        running_vloss = 0.0
         with torch.no_grad():
-            for i, vdata in enumerate(val_dataloader):
-                vinputs, vlabels = vdata
+            for vinputs, vlabels in val_dataloader:
                 voutputs = m(vinputs.to(device))
                 vloss = criterion(voutputs, vlabels.to(device))
-                running_vloss += vloss
-                _, vpredictions = voutputs.max(dim=-1)
-
+                running_vloss += vloss.item()
+        
         avg_vloss = running_vloss / len(val_dataloader)
-        print('LOSS : train {} | valid {}'.format(round(avg_loss, 4), round(avg_vloss.item(), 4)))
-
-        # Track best performance, and save the model's state
-        # if avg_vloss < best_vloss:
-        #     best_vloss = avg_vloss
-        #     torch.save(m.state_dict(), path)
-
-        epoch_number += 1
-
-# %%
-train(pretrained_model, pretrained_optimizer)
-
-# %%
-train(non_pretrained_model, non_pretrained_optimizer)
-
+        print(f'LOSS: train {round(avg_loss, 4)} | valid {round(avg_vloss, 4)}')
+        
+        if avg_vloss < best_vloss:
+            best_vloss = avg_vloss
+            if path!="":
+                torch.save(m.state_dict(), path)
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= patience or math.isnan(avg_loss) or math.isinf(avg_loss):
+            print("Early stopping triggered")
+            break
 
 # %%
-def predict(model, path):
+def objective(trial, pretrained=False):
+        
+    lr = trial.suggest_float("lr", 1e-8, 5e-4)
+    momentum = trial.suggest_float("momentum", 0.7, 0.99)
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    
+    
+    if pretrained:
+        model = models.swin_v2_b(weights= models.Swin_V2_B_Weights.DEFAULT)
+
+    else:
+        model = models.swin_v2_b()
+    
+    num_features = model.head.in_features
+    model.head = torch.nn.Linear(num_features, 4)
+    model.to(device)
+    
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    
+    train(model, optimizer)
+    
     model.eval()
-    predictions = []  # Inizializza una lista per memorizzare le predizioni
+    running_vloss = 0.0
     with torch.no_grad():
-        for _, data in enumerate(test_dataloader):
-            inputs = data[0].to(device)
-            # Effettua le previsioni utilizzando il modello
-            outputs = model(inputs)
-            # Aggiungi le predizioni alla lista delle predizioni
-            predictions.append(outputs.cpu().numpy())
+        for vinputs, vlabels in val_dataloader:
+            voutputs = model(vinputs.to(device))
+            vloss = criterion(voutputs, vlabels.to(device))
+            running_vloss += vloss.item()
+    
+    return running_vloss / len(val_dataloader)
 
-    predictions_array = np.concatenate(predictions)
-    submission_df = pd.DataFrame(data=predictions_array, columns=["P", "K", "Mg", "pH"])
-    submission_df.to_csv(path, index_label="sample_index")
+# Trova i migliori iperparametri
+study = optuna.create_study(direction="minimize")
+study.optimize(partial(objective, pretrained=True), n_trials=100)
+
+
+best_params = study.best_params
+print("Best hyperparameters:", best_params)
+
+# Riallenamento con i migliori iperparametri
+final_model = models.swin_v2_b(weights= models.Swin_V2_B_Weights.DEFAULT)
+num_features = final_model.head.in_features
+final_model.head = torch.nn.Linear(num_features, 4)
+final_model.to(device)
+final_optimizer = torch.optim.SGD(final_model.parameters(), lr=best_params["lr"], momentum=best_params["momentum"], weight_decay=best_params["weight_decay"])
+train(final_model, final_optimizer, path="best_model.pth")
 
 # %%
-predict(pretrained_model, "pretrained_model_submission.csv")
-predict(non_pretrained_model, "non_pretrained_model_submission.csv")
+# def predict(model, path):
+#     model.eval()
+#     predictions = []  # Inizializza una lista per memorizzare le predizioni
+#     with torch.no_grad():
+#         for _, data in enumerate(test_dataloader):
+#             inputs = data[0].to(device)
+#             # Effettua le previsioni utilizzando il modello
+#             outputs = model(inputs)
+#             # Aggiungi le predizioni alla lista delle predizioni
+#             predictions.append(outputs.cpu().numpy())
+
+#     predictions_array = np.concatenate(predictions)
+#     submission_df = pd.DataFrame(data=predictions_array, columns=["P", "K", "Mg", "pH"])
+#     submission_df.to_csv(path, index_label="sample_index")
+
+# %%
+# predict(pretrained_model, "pretrained_model_submission.csv")
+# predict(non_pretrained_model, "non_pretrained_model_submission.csv")
 
 # %% [markdown]
 # 

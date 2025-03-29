@@ -1,4 +1,4 @@
-#!/disk4/gdpalma/home/space-ai/nn-approach/hyperview/hyperenv/bin/python
+#!/root/space-ai/nn-approach/hyperview/hyperenv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
